@@ -21,7 +21,7 @@ const path = require('path');
 const BASE = process.env.REPO_RAW_BASE
   || 'https://raw.githubusercontent.com/therealfreddied/9router-pterodactyl/main/';
 
-const FILES = ['start.sh', 'server.js'];
+const FILES = ['start.sh', 'server.js', 'extract.js'];
 
 // The panel may mount the cwd read-only for the runtime user (Wispbyte does:
 // EACCES on writeFileSync in /home/container). Pick a writable work dir.

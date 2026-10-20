@@ -97,43 +97,56 @@ if [ "$NODE_MAJOR" -lt 20 ]; then
 fi
 
 # ---------- install / update ----------
+# npm install needs the cache, a staging tree, AND the final tree simultaneously.
+# On a small egg that is what triggers ENOSPC. Fetching the registry tarball and
+# extracting it in one pass costs ~53 MB total instead of several hundred.
 WANT="${NINEROUTER_VERSION:-latest}"
 MARK="$APP_HOME/.installed_version"
 CUR=""
 [ -f "$MARK" ] && CUR=$(cat "$MARK" 2>/dev/null || true)
 
-if [ "$WANT" = "latest" ]; then
-  TARGET=$(npm view 9router version --silent 2>/dev/null || true)
-  [ -z "$TARGET" ] && TARGET="$CUR"
-else
-  TARGET="$WANT"
-fi
+APP="$APP_HOME/pkg/package/app"
 
-# Install into a writable prefix (set above via npm_config_prefix). `npm install -g`
-# would need root-owned /usr/local/lib, which fails with EACCES on panels that run
-# as a non-root user (Wispbyte).
-APP="$PREFIX/node_modules/9router/app"
+resolve_version() {
+  if [ "$WANT" != "latest" ]; then
+    printf '%s' "$WANT"
+    return 0
+  fi
+  # Prefer the registry's dist-tags over npm CLI (works with node alone).
+  node -e '
+    fetch("https://registry.npmjs.org/9router", {redirect:"follow"})
+      .then(r => r.json())
+      .then(d => { const v = d["dist-tags"] && d["dist-tags"].latest; if (v) console.log(v); })
+      .catch(() => {});
+  ' 2>/dev/null || true
+}
+
+TARGET="$(resolve_version)"
+[ -z "$TARGET" ] && TARGET="$CUR"
+
 if [ -d "$APP" ] && [ -n "$TARGET" ] && [ "$CUR" = "$TARGET" ]; then
   echo "[9router] already at $TARGET"
 else
-  GLOBAL_APP="$(npm root -g 2>/dev/null)/9router/app"
-  if [ -d "$GLOBAL_APP" ] && [ "$WANT" = "latest" ]; then
-    APP="$GLOBAL_APP"
-    echo "[9router] using preinstalled global copy at $APP"
-  else
-    echo "[9router] installing 9router@${TARGET:-latest} (first run takes a few minutes)"
-    mkdir -p "$PREFIX"
-    if ! npm install --prefix "$PREFIX" "9router@${TARGET:-latest}" \
-         --no-audit --no-fund --loglevel=error; then
-      echo "[9router] ERROR: npm install failed" >&2
-      echo "[9router] hint: check network access and disk space" >&2
-      exit 1
-    fi
+  [ -n "$TARGET" ] || TARGET="latest"
+  echo "[9router] installing 9router@$TARGET (direct extract, no npm)"
+
+  URL="https://registry.npmjs.org/9router/-/9router-$TARGET.tgz"
+
+  # Drop any previous tree first; a failed extract otherwise doubles usage.
+  rm -rf "$APP_HOME/pkg" 2>/dev/null || true
+  mkdir -p "$APP_HOME/pkg"
+
+  # extract.js streams the tarball through memory, so no .tgz ever lands on
+  # disk. Peak usage is only the extracted tree (~53 MB).
+  if ! node "$WORK/extract.js" "$URL" "$APP_HOME/pkg"; then
+    echo "[9router] ERROR: install failed (out of disk space?)" >&2
+    echo "[9router] need ~60 MB free in $WORK" >&2
+    exit 1
   fi
 fi
 
 [ -d "$APP" ] || { echo "[9router] ERROR: app payload missing at $APP" >&2; exit 1; }
-[ -n "$TARGET" ] && echo "$TARGET" > "$MARK" 2>/dev/null || true
+[ -n "$TARGET" ] && printf '%s' "$TARGET" > "$MARK" 2>/dev/null || true
 
 # ---------- secrets ----------
 if [ -z "${JWT_SECRET:-}" ]; then
