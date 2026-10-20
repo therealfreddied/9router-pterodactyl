@@ -6,9 +6,30 @@
 # package for its app payload, then launch its bundled Next.js server directly.
 
 set -eu
-# Install into the working directory, not the script's own location. Panels
-# often curl the script to /tmp and expect the server files beside the home dir.
-cd "${INSTALL_DIR:-$PWD}"
+
+# Panels sometimes mount /home/container read-only for the runtime user, so we
+# cannot assume the script's own directory is writable. Pick the first writable
+# location: explicit INSTALL_DIR, cwd, HOME, then temp dirs.
+pick_dir() {
+  for d in "${INSTALL_DIR:-}" "$PWD" "${HOME:-}" /tmp /var/tmp; do
+    [ -n "$d" ] || continue
+    mkdir -p "$d" 2>/dev/null || continue
+    if ( : > "$d/.wtest.$$" ) 2>/dev/null; then
+      rm -f "$d/.wtest.$$" 2>/dev/null || true
+      printf '%s' "$d"
+      return 0
+    fi
+  done
+  return 1
+}
+
+WORK="$(pick_dir || true)"
+if [ -z "$WORK" ]; then
+  echo "[9router] ERROR: no writable directory (tried INSTALL_DIR, \$PWD, \$HOME, /tmp, /var/tmp)" >&2
+  exit 1
+fi
+cd "$WORK"
+[ "$WORK" = "$PWD" ] || echo "[9router] working directory: $WORK"
 
 PORT="${SERVER_PORT:-}"
 [ -z "$PORT" ] && PORT="${SERVER_ALLOCATION_PORT:-}"

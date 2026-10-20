@@ -23,7 +23,31 @@ const BASE = process.env.REPO_RAW_BASE
 
 const FILES = ['start.sh', 'server.js'];
 
-const outDir = process.env.INSTALL_DIR || process.cwd();
+// The panel may mount the cwd read-only for the runtime user (Wispbyte does:
+// EACCES on writeFileSync in /home/container). Pick a writable work dir.
+function pickDir() {
+  const candidates = [
+    process.env.INSTALL_DIR,
+    process.cwd(),
+    process.env.HOME,
+    '/tmp',
+    '/var/tmp',
+  ].filter(Boolean);
+  for (const d of candidates) {
+    try {
+      fs.mkdirSync(d, { recursive: true });
+      const probe = path.join(d, '.wtest.' + process.pid);
+      fs.writeFileSync(probe, 'x');
+      fs.unlinkSync(probe);
+      return d;
+    } catch (_) {
+      /* try next */
+    }
+  }
+  return null;
+}
+
+const outDir = pickDir();
 
 async function grab(name) {
   const url = BASE + name + '?t=' + Date.now();
@@ -45,6 +69,11 @@ async function grab(name) {
     console.error('[bootstrap] ERROR: this Node has no global fetch (need >= 18)');
     process.exit(1);
   }
+  if (!outDir) {
+    console.error('[bootstrap] ERROR: no writable directory for install files');
+    process.exit(1);
+  }
+  console.log('[bootstrap] install dir: ' + outDir);
   try {
     for (const f of FILES) await grab(f);
   } catch (err) {
