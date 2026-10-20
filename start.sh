@@ -89,15 +89,28 @@ else
   TARGET="$WANT"
 fi
 
-GLOBAL_APP="$(npm root -g 2>/dev/null)/9router/app"
-if [ -d "$GLOBAL_APP" ]; then
-  APP="$GLOBAL_APP"
-  echo "[9router] using global install at $APP"
+# Install into a writable prefix. `npm install -g` needs root-owned /usr/local/lib,
+# which fails with EACCES on panels that run as a non-root user (Wispbyte).
+PREFIX="$APP_HOME/npm"
+APP="$PREFIX/node_modules/9router/app"
+
+if [ -d "$APP" ] && [ -n "$TARGET" ] && [ "$CUR" = "$TARGET" ]; then
+  echo "[9router] already at $TARGET"
 else
-  echo "[9router] installing 9router@${TARGET:-latest} (first run takes a few minutes)"
-  npm install -g "9router@${TARGET:-latest}" --no-audit --no-fund --loglevel=error
-  GLOBAL_APP="$(npm root -g)/9router/app"
-  APP="$GLOBAL_APP"
+  GLOBAL_APP="$(npm root -g 2>/dev/null)/9router/app"
+  if [ -d "$GLOBAL_APP" ] && [ "$WANT" = "latest" ]; then
+    APP="$GLOBAL_APP"
+    echo "[9router] using preinstalled global copy at $APP"
+  else
+    echo "[9router] installing 9router@${TARGET:-latest} (first run takes a few minutes)"
+    mkdir -p "$PREFIX"
+    if ! npm install --prefix "$PREFIX" "9router@${TARGET:-latest}" \
+         --no-audit --no-fund --loglevel=error; then
+      echo "[9router] ERROR: npm install failed" >&2
+      echo "[9router] hint: check network access and disk space" >&2
+      exit 1
+    fi
+  fi
 fi
 
 [ -d "$APP" ] || { echo "[9router] ERROR: app payload missing at $APP" >&2; exit 1; }
