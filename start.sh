@@ -65,6 +65,26 @@ DATA="${DATA_DIR:-./data}"
 APP_HOME="$PWD/app-home"
 mkdir -p "$DATA" "$APP_HOME"
 
+# npm resolves its cache as $HOME/.npm. On Wispbyte $HOME is the read-only
+# /home/container, so npm dies with EACCES before it downloads anything.
+# Pin every npm path into our writable work dir instead.
+NPM_CACHE="$APP_HOME/.npm-cache"
+NPM_TMP="$APP_HOME/.npm-tmp"
+PREFIX="$APP_HOME/npm"
+mkdir -p "$NPM_CACHE" "$NPM_TMP" "$PREFIX" 2>/dev/null || true
+export npm_config_cache="$NPM_CACHE"
+export npm_config_tmp="$NPM_TMP"
+export npm_config_prefix="$PREFIX"
+export npm_config_update_notifier=false
+export TMPDIR="$NPM_TMP"
+
+# If $HOME itself is unwritable, repoint it so anything else that follows the
+# convention ($HOME/.config, $HOME/.cache) lands somewhere usable.
+if [ -n "${HOME:-}" ] && [ ! -w "$HOME" ]; then
+  export HOME="$PWD"
+  echo "[9router] HOME was read-only; using $HOME"
+fi
+
 need() { command -v "$1" >/dev/null 2>&1; }
 
 need node || { echo "[9router] ERROR: node not found on PATH" >&2; exit 1; }
@@ -89,11 +109,10 @@ else
   TARGET="$WANT"
 fi
 
-# Install into a writable prefix. `npm install -g` needs root-owned /usr/local/lib,
-# which fails with EACCES on panels that run as a non-root user (Wispbyte).
-PREFIX="$APP_HOME/npm"
+# Install into a writable prefix (set above via npm_config_prefix). `npm install -g`
+# would need root-owned /usr/local/lib, which fails with EACCES on panels that run
+# as a non-root user (Wispbyte).
 APP="$PREFIX/node_modules/9router/app"
-
 if [ -d "$APP" ] && [ -n "$TARGET" ] && [ "$CUR" = "$TARGET" ]; then
   echo "[9router] already at $TARGET"
 else
