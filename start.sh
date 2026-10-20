@@ -40,28 +40,32 @@ writable() { d="$1"; [ -n "$d" ] || return 1
 # ---------- where can we actually write? ----------
 # Pterodactyl's /home/container is persistent but often not writable by the
 # runtime user (Wispbyte: dir owned by 999:995, runtime uid 1001). The panel's
-# file manager CAN write there, which is how the payload gets uploaded.
-WRITE_BASE=""
-for cand in "${INSTALL_DIR:-}" "/home/container" "$HOME" "/home/node" "/tmp" "/var/tmp"; do
-  if writable "$cand"; then WRITE_BASE="$cand"; break; fi
-done
-[ -n "$WRITE_BASE" ] || { echo "[9router] ERROR: no writable directory" >&2; exit 1; }
+# file manager CAN write there, so the durable flow is:
+#   1. file manager: create a folder (e.g. "9router") and chmod it 777
+#   2. file manager: upload 9router-payload.tar.gz into /home/container
+#   3. startup: expand the payload into that writable subfolder, then boot
+writable() { d="$1"; [ -n "$d" ] || return 1
+  mkdir -p "$d" 2>/dev/null || return 1
+  ( : > "$d/.wtest.$$" ) 2>/dev/null || return 1
+  rm -f "$d/.wtest.$$" 2>/dev/null; return 0; }
 
-# Payload source: a file the panel gave us, else the published release.
-PAYLOAD_TGZ=""
-for t in "/home/container/9router-payload.tar.gz" "/home/container/9router/9router-payload.tar.gz" \
-         "$WRITE_BASE/9router-payload.tar.gz" "$WRITE_BASE/9router/9router-payload.tar.gz" \
-         "$PWD/9router-payload.tar.gz"; do
-  if [ -f "$t" ]; then PAYLOAD_TGZ="$t"; break; fi
+# Prefer a persistent+subdir that the file manager made writable for us.
+APPDIR=""
+for cand in "${INSTALL_DIR:-}" "/home/container/9router" "/home/container/app" "$HOME/9router" "$HOME" "/home/node" "/tmp" "/var/tmp"; do
+  if writable "$cand"; then APPDIR="$cand"; break; fi
 done
-
-# Extraction target: persistent if we can write there, else a tmpfs.
-APPDIR="$WRITE_BASE/9router"
-if ! writable "$APPDIR"; then
-  APPDIR="/tmp/9router"
-  mkdir -p "$APPDIR"
-  echo "[9router] no persistent writable dir; expanding into $APPDIR (resets each reboot)"
+[ -n "$APPDIR" ] || { echo "[9router] ERROR: no writable directory" >&2; exit 1; }
+if [ "$APPDIR" = "/tmp" ] || [ "$APPDIR" = "/var/tmp" ] || [ "$APPDIR" = "/home/node" ]; then
+  APPDIR="$APPDIR/9router"
+  mkdir -p "$APPDIR" 2>/dev/null || true
+  echo "[9router] no persistent writable dir; using $APPDIR (resets each reboot)"
 fi
+echo "[9router] install dir: $APPDIR"
+
+WRITE_BASE="$(dirname "$APPDIR")"
+
+# Extraction target: the writable dir we found above.
+mkdir -p "$APPDIR" 2>/dev/null || true
 
 # The app payload lives at <APPDIR>/app.
 APP="$APPDIR/app"
@@ -95,8 +99,8 @@ if [ -f "$APP/server.js" ] && [ -f "$MARK" ]; then
   echo "[9router] payload present ($(cat "$MARK" 2>/dev/null || echo unknown)) - skipping install"
 else
   EXTRACT=""
-  for e in "/home/container/9router/extract.js" "$WRITE_BASE/9router/extract.js" \
-           "$WRITE_BASE/extract.js" "$(dirname "$0")/extract.js" "$PWD/extract.js" "/tmp/extract.js"; do
+  for e in "/home/container/9router/extract.js" "$APPDIR/extract.js" "$WRITE_BASE/extract.js" \
+           "/home/container/extract.js" "$(dirname "$0")/extract.js" "$PWD/extract.js" "/tmp/extract.js"; do
     if [ -f "$e" ]; then EXTRACT="$e"; break; fi
   done
   if [ -z "$EXTRACT" ]; then
@@ -107,9 +111,17 @@ else
   mkdir -p "$APPDIR"
   rm -rf "$APP" 2>/dev/null || true
 
-  if [ -n "$PAYLOAD_TGZ" ]; then
-    echo "[9router] expanding local payload: $PAYLOAD_TGZ"
-    node "$EXTRACT" "$PAYLOAD_TGZ" "$APPDIR" || { echo "[9router] ERROR: extract failed" >&2; exit 1; }
+  # Payload source: a file the panel's file manager gave us, else the release.
+  LOCAL_TGZ=""
+  for t in "/home/container/9router-payload.tar.gz" "/home/container/9router/9router-payload.tar.gz" \
+           "$APPDIR/9router-payload.tar.gz" "$WRITE_BASE/9router-payload.tar.gz" \
+           "$PWD/9router-payload.tar.gz"; do
+    if [ -f "$t" ]; then LOCAL_TGZ="$t"; break; fi
+  done
+
+  if [ -n "$LOCAL_TGZ" ]; then
+    echo "[9router] expanding local payload: $LOCAL_TGZ"
+    node "$EXTRACT" "$LOCAL_TGZ" "$APPDIR" || { echo "[9router] ERROR: extract failed" >&2; exit 1; }
   else
     echo "[9router] downloading payload (one time) from $PAYLOAD_URL"
     node "$EXTRACT" "$PAYLOAD_URL" "$APPDIR" || {
@@ -127,11 +139,20 @@ else
 fi
 
 # ---------- data dir ----------
-DATA="${DATA_DIR:-$WRITE_BASE/9router-data}"
+# The DB and generated secrets must live in a dir we can actually write. The
+# parent of APPDIR may be read-only (Wispbyte: /home/container is 755 owned by
+# 999:995, runtime is uid 1001), so keep data INSIDE the writable APPDIR.
+DATA="${DATA_DIR:-$APPDIR/data}"
 if ! writable "$DATA"; then
-  DATA="$WRITE_BASE/data"
+  DATA="$APPDIR/data"
   mkdir -p "$DATA" 2>/dev/null || true
+  if ! writable "$DATA"; then
+    DATA="/tmp/9router-data"
+    mkdir -p "$DATA" 2>/dev/null || true
+    echo "[9router] WARN: no persistent data dir; using $DATA (resets each reboot)"
+  fi
 fi
+echo "[9router] data dir: $DATA"
 
 # ---------- secrets ----------
 if [ -z "${JWT_SECRET:-}" ]; then
