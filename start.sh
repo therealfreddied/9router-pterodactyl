@@ -166,6 +166,8 @@ if [ -d "$SQLJS_DIR" ] && [ ! -f "$SQLJS_DIR/sql-wasm.wasm" ]; then
       console.log("[9router] sql wasm " + Math.round(b.length/1024) + " KB");
     }).catch(e => { console.error(e.message); process.exit(1); });
   ' "https://cdn.jsdelivr.net/npm/sql.js@${SQLJS_VER}/dist/sql-wasm.wasm" "$SQLJS_DIR/sql-wasm.wasm"; then
+    : # success; the node reporter already logged the size
+  else
     echo "[9router] WARN: could not fetch sql wasm; DB features will be disabled" >&2
   fi
 fi
