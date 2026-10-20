@@ -18,11 +18,17 @@ const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
 
-const [archive, dest] = process.argv.slice(2);
+const [archive, dest, ...flags] = process.argv.slice(2);
 if (!archive || !dest) {
-  console.error('usage: node extract.js <archive.tgz|url> <destDir>');
+  console.error('usage: node extract.js <archive.tgz|url> <destDir> [--only <path>]');
   process.exit(2);
 }
+
+// --only <path> extracts a single member. Used to pull sql-wasm.wasm out of the
+// sql.js tarball without unpacking the other 9 MB.
+let only = null;
+const onlyIdx = flags.indexOf('--only');
+if (onlyIdx !== -1 && flags[onlyIdx + 1]) only = flags[onlyIdx + 1].replace(/^\.\//, '');
 
 function str(b, off, len) {
   const slice = b.subarray(off, off + len);
@@ -75,7 +81,10 @@ function extract(tar) {
     }
 
     // Refuse path traversal.
-    const target = path.resolve(root, name.replace(/^\.\//, ''));
+    const rel = name.replace(/^\.\//, '');
+    if (only && rel !== only) continue;
+
+    const target = path.resolve(root, rel);
     if (target !== root && !target.startsWith(root + path.sep)) continue;
 
     if (type === '5') {

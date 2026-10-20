@@ -145,6 +145,31 @@ else
   fi
 fi
 
+# ---------- repair: sql.js wasm ----------
+# 9router's published tarball ships sql.js/dist/sql-wasm.js but NOT the
+# sql-wasm.wasm it loads, so every driver fails with
+#   [DB] No SQLite driver available (bun/better/node/sql.js all failed)
+# Pull the matching wasm straight from the CDN and drop it beside the loader.
+SQLJS_DIR="$APP/node_modules/sql.js/dist"
+if [ -d "$SQLJS_DIR" ] && [ ! -f "$SQLJS_DIR/sql-wasm.wasm" ]; then
+  SQLJS_VER=$(node -p 'require("'"$APP"'/node_modules/sql.js/package.json").version' 2>/dev/null || echo "")
+  [ -z "$SQLJS_VER" ] && SQLJS_VER="1.14.2"
+  echo "[9router] repairing sql.js wasm (v$SQLJS_VER)"
+  if node -e '
+    const fs = require("fs");
+    const [url, dest] = process.argv.slice(1);
+    fetch(url, {redirect:"follow"}).then(async r => {
+      if (!r.ok) { console.error("HTTP " + r.status); process.exit(2); }
+      const b = Buffer.from(await r.arrayBuffer());
+      if (b.length < 100000) { console.error("too small: " + b.length); process.exit(3); }
+      fs.writeFileSync(dest, b);
+      console.log("[9router] sql wasm " + Math.round(b.length/1024) + " KB");
+    }).catch(e => { console.error(e.message); process.exit(1); });
+  ' "https://cdn.jsdelivr.net/npm/sql.js@${SQLJS_VER}/dist/sql-wasm.wasm" "$SQLJS_DIR/sql-wasm.wasm"; then
+    echo "[9router] WARN: could not fetch sql wasm; DB features will be disabled" >&2
+  fi
+fi
+
 [ -d "$APP" ] || { echo "[9router] ERROR: app payload missing at $APP" >&2; exit 1; }
 [ -n "$TARGET" ] && printf '%s' "$TARGET" > "$MARK" 2>/dev/null || true
 
