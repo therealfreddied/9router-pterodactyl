@@ -1,89 +1,23 @@
 #!/bin/sh
-# 9router — zero-build bootstrap for Pterodactyl / bare hosts.
-# Installs the LATEST official npm package and serves the dashboard.
+# 9router — persistent-payload bootstrap for Pterodactyl / bare hosts.
 #
-# Why not the CLI? `9router` refuses to bind 0.0.0.0 in CLI mode. We install the
-# package for its app payload, then launch its bundled Next.js server directly.
+# Installs ONCE into a persistent directory, then boots. Re-running after the
+# payload is in place does no network work at all.
+#
+# Order of preference for the install directory:
+#   1. $INSTALL_DIR            (explicit; use this for a persistent volume)
+#   2. /home/container         (Pterodactyl's persistent server dir)
+#   3. /home/node, /tmp, /var/tmp
+#
+# Payload source, first match wins:
+#   1. a local 9router-payload.tar.gz in the install dir (upload via file manager)
+#   2. the GitHub release asset (downloaded once)
 
 set -eu
 
-# Panels sometimes mount /home/container read-only for the runtime user, so we
-# cannot assume the script's own directory is writable. Pick the first writable
-# location: explicit INSTALL_DIR, cwd, HOME, then temp dirs.
-pick_dir() {
-  for d in "${INSTALL_DIR:-}" "$PWD" "${HOME:-}" /tmp /var/tmp; do
-    [ -n "$d" ] || continue
-    mkdir -p "$d" 2>/dev/null || continue
-    if ( : > "$d/.wtest.$$" ) 2>/dev/null; then
-      rm -f "$d/.wtest.$$" 2>/dev/null || true
-      printf '%s' "$d"
-      return 0
-    fi
-  done
-  return 1
-}
-
-WORK="$(pick_dir || true)"
-if [ -z "$WORK" ]; then
-  echo "[9router] ERROR: no writable directory (tried INSTALL_DIR, \$PWD, \$HOME, /tmp, /var/tmp)" >&2
-  exit 1
-fi
-cd "$WORK"
-[ "$WORK" = "$PWD" ] || echo "[9router] working directory: $WORK"
-
-PORT="${SERVER_PORT:-}"
-[ -z "$PORT" ] && PORT="${SERVER_ALLOCATION_PORT:-}"
-[ -z "$PORT" ] && PORT="${LISTEN_PORT:-}"
-[ -z "$PORT" ] && PORT="${PORT:-}"
-
-# Panels like Wispbyte hand every user a different allocation, and not all eggs
-# export SERVER_PORT. Fall back to a remembered port, then ask, then default.
-if [ -z "$PORT" ] && [ -f ".port" ]; then
-  PORT=$(tr -d ' \t\r\n' < .port 2>/dev/null || true)
-fi
-
-if [ -z "$PORT" ]; then
-  if [ -t 0 ] && [ -t 1 ]; then
-    echo "[9router] No SERVER_PORT from the panel."
-    printf '[9router] Port to listen on [10000]: '
-    read -r PORT_IN || PORT_IN=""
-    PORT="${PORT_IN:-10000}"
-  else
-    PORT=10000
-    echo "[9router] WARN: panel provided no port; defaulting to $PORT (set SERVER_PORT to override)"
-  fi
-fi
-
-case "$PORT" in
-  ''|*[!0-9]*)
-    echo "[9router] ERROR: invalid port '$PORT' (must be numeric)" >&2
-    exit 1
-    ;;
-esac
-printf '%s' "$PORT" > .port 2>/dev/null || true
-DATA="${DATA_DIR:-./data}"
-APP_HOME="$PWD/app-home"
-mkdir -p "$DATA" "$APP_HOME"
-
-# npm resolves its cache as $HOME/.npm. On Wispbyte $HOME is the read-only
-# /home/container, so npm dies with EACCES before it downloads anything.
-# Pin every npm path into our writable work dir instead.
-NPM_CACHE="$APP_HOME/.npm-cache"
-NPM_TMP="$APP_HOME/.npm-tmp"
-PREFIX="$APP_HOME/npm"
-mkdir -p "$NPM_CACHE" "$NPM_TMP" "$PREFIX" 2>/dev/null || true
-export npm_config_cache="$NPM_CACHE"
-export npm_config_tmp="$NPM_TMP"
-export npm_config_prefix="$PREFIX"
-export npm_config_update_notifier=false
-export TMPDIR="$NPM_TMP"
-
-# If $HOME itself is unwritable, repoint it so anything else that follows the
-# convention ($HOME/.config, $HOME/.cache) lands somewhere usable.
-if [ -n "${HOME:-}" ] && [ ! -w "$HOME" ]; then
-  export HOME="$PWD"
-  echo "[9router] HOME was read-only; using $HOME"
-fi
+PAYLOAD_VERSION="${PAYLOAD_VERSION:-1}"
+RELEASE_BASE="${RELEASE_BASE:-https://github.com/therealfreddied/9router-payload/releases/download/v1}"
+PAYLOAD_URL="${PAYLOAD_URL:-$RELEASE_BASE/9router-payload.tar.gz}"
 
 need() { command -v "$1" >/dev/null 2>&1; }
 
@@ -92,90 +26,90 @@ need node || { echo "[9router] ERROR: node not found on PATH" >&2; exit 1; }
 NODE_MAJOR=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)
 if [ "$NODE_MAJOR" -lt 20 ]; then
   echo "[9router] ERROR: Node >= 20.9 required, found $(node -v)" >&2
-  echo "[9router] hint: switch the egg image, or install Node 22" >&2
   exit 1
 fi
 
-# ---------- install / update ----------
-# npm install needs the cache, a staging tree, AND the final tree simultaneously.
-# On a small egg that is what triggers ENOSPC. Fetching the registry tarball and
-# extracting it in one pass costs ~53 MB total instead of several hundred.
-WANT="${NINEROUTER_VERSION:-latest}"
-MARK="$APP_HOME/.installed_version"
-CUR=""
-[ -f "$MARK" ] && CUR=$(cat "$MARK" 2>/dev/null || true)
+# ---------- pick the install dir ----------
+writable() { d="$1"; [ -n "$d" ] || return 1; mkdir -p "$d" 2>/dev/null || return 1
+  ( : > "$d/.wtest.$$" ) 2>/dev/null || return 1; rm -f "$d/.wtest.$$" 2>/dev/null; return 0; }
 
-APP="$APP_HOME/pkg/package/app"
+BASE=""
+for cand in "${INSTALL_DIR:-}" "/home/container" "$HOME" "/home/node" "/tmp" "/var/tmp"; do
+  if writable "$cand"; then BASE="$cand"; break; fi
+done
+[ -n "$BASE" ] || { echo "[9router] ERROR: no writable install directory" >&2; exit 1; }
+echo "[9router] install dir: $BASE"
 
-resolve_version() {
-  if [ "$WANT" != "latest" ]; then
-    printf '%s' "$WANT"
-    return 0
+APP="$BASE/9router/app"
+MARK="$BASE/9router/.installed"
+
+# ---------- port ----------
+PORT="${SERVER_PORT:-}"
+[ -z "$PORT" ] && PORT="${SERVER_ALLOCATION_PORT:-}"
+[ -z "$PORT" ] && PORT="${LISTEN_PORT:-}"
+[ -z "$PORT" ] && PORT="${PORT:-}"
+if [ -z "$PORT" ] && [ -f "$BASE/.port" ]; then
+  PORT=$(tr -d ' \t\r\n' < "$BASE/.port" 2>/dev/null || true)
+fi
+if [ -z "$PORT" ]; then
+  if [ -t 0 ] && [ -t 1 ]; then
+    printf '[9router] Port to listen on [10000]: '
+    read -r PORT_IN || PORT_IN=""
+    PORT="${PORT_IN:-10000}"
+  else
+    PORT=10000
+    echo "[9router] WARN: no port from panel; using $PORT"
   fi
-  # Prefer the registry's dist-tags over npm CLI (works with node alone).
-  node -e '
-    fetch("https://registry.npmjs.org/9router", {redirect:"follow"})
-      .then(r => r.json())
-      .then(d => { const v = d["dist-tags"] && d["dist-tags"].latest; if (v) console.log(v); })
-      .catch(() => {});
-  ' 2>/dev/null || true
-}
+fi
+case "$PORT" in
+  ''|*[!0-9]*) echo "[9router] ERROR: invalid port '$PORT'" >&2; exit 1 ;;
+esac
+printf '%s' "$PORT" > "$BASE/.port" 2>/dev/null || true
 
-TARGET="$(resolve_version)"
-[ -z "$TARGET" ] && TARGET="$CUR"
-
-if [ -d "$APP" ] && [ -n "$TARGET" ] && [ "$CUR" = "$TARGET" ]; then
-  echo "[9router] already at $TARGET"
+# ---------- install (only if missing) ----------
+if [ -f "$APP/server.js" ] && [ -f "$MARK" ]; then
+  echo "[9router] payload already installed ($(cat "$MARK" 2>/dev/null || echo unknown))"
 else
-  [ -n "$TARGET" ] || TARGET="latest"
-  echo "[9router] installing 9router@$TARGET (direct extract, no npm)"
+  echo "[9router] installing payload (one time)..."
+  mkdir -p "$BASE/9router"
 
-  URL="https://registry.npmjs.org/9router/-/9router-$TARGET.tgz"
+  LOCAL_TGZ=""
+  for t in "/home/container/9router-payload.tar.gz" "$BASE/9router-payload.tar.gz" "$BASE/9router/9router-payload.tar.gz" "$PWD/9router-payload.tar.gz"; do
+    if [ -f "$t" ]; then LOCAL_TGZ="$t"; break; fi
+  done
 
-  # Drop any previous tree first; a failed extract otherwise doubles usage.
-  rm -rf "$APP_HOME/pkg" 2>/dev/null || true
-  mkdir -p "$APP_HOME/pkg"
-
-  # extract.js streams the tarball through memory, so no .tgz ever lands on
-  # disk. Peak usage is only the extracted tree (~53 MB).
-  if ! node "$WORK/extract.js" "$URL" "$APP_HOME/pkg"; then
-    echo "[9router] ERROR: install failed (out of disk space?)" >&2
-    echo "[9router] need ~60 MB free in $WORK" >&2
+  EXTRACT=""
+  for e in "$BASE/9router/extract.js" "$(dirname "$0")/extract.js" "$PWD/extract.js" "/tmp/extract.js"; do
+    if [ -f "$e" ]; then EXTRACT="$e"; break; fi
+  done
+  if [ -z "$EXTRACT" ]; then
+    echo "[9router] ERROR: extract.js not found (bootstrap should fetch it)" >&2
     exit 1
   fi
-fi
+  echo "[9router] using extractor: $EXTRACT"
 
-# ---------- repair: sql.js wasm ----------
-# 9router's published tarball ships sql.js/dist/sql-wasm.js but NOT the
-# sql-wasm.wasm it loads, so every driver fails with
-#   [DB] No SQLite driver available (bun/better/node/sql.js all failed)
-# Pull the matching wasm straight from the CDN and drop it beside the loader.
-SQLJS_DIR="$APP/node_modules/sql.js/dist"
-if [ -d "$SQLJS_DIR" ] && [ ! -f "$SQLJS_DIR/sql-wasm.wasm" ]; then
-  SQLJS_VER=$(node -p 'require("'"$APP"'/node_modules/sql.js/package.json").version' 2>/dev/null || echo "")
-  [ -z "$SQLJS_VER" ] && SQLJS_VER="1.14.2"
-  echo "[9router] repairing sql.js wasm (v$SQLJS_VER)"
-  if node -e '
-    const fs = require("fs");
-    const [url, dest] = process.argv.slice(1);
-    fetch(url, {redirect:"follow"}).then(async r => {
-      if (!r.ok) { console.error("HTTP " + r.status); process.exit(2); }
-      const b = Buffer.from(await r.arrayBuffer());
-      if (b.length < 100000) { console.error("too small: " + b.length); process.exit(3); }
-      fs.writeFileSync(dest, b);
-      console.log("[9router] sql wasm " + Math.round(b.length/1024) + " KB");
-    }).catch(e => { console.error(e.message); process.exit(1); });
-  ' "https://cdn.jsdelivr.net/npm/sql.js@${SQLJS_VER}/dist/sql-wasm.wasm" "$SQLJS_DIR/sql-wasm.wasm"; then
-    : # success; the node reporter already logged the size
+  if [ -n "$LOCAL_TGZ" ]; then
+    echo "[9router] using local payload: $LOCAL_TGZ"
+    node "$EXTRACT" "$LOCAL_TGZ" "$BASE" || { echo "[9router] ERROR: extract failed" >&2; exit 1; }
   else
-    echo "[9router] WARN: could not fetch sql wasm; DB features will be disabled" >&2
+    echo "[9router] downloading payload from $PAYLOAD_URL"
+    node "$EXTRACT" "$PAYLOAD_URL" "$BASE" || {
+      echo "[9router] ERROR: payload download/extract failed" >&2
+      echo "[9router] hint: upload 9router-payload.tar.gz to $BASE via the file manager" >&2
+      exit 1
+    }
   fi
+
+  [ -f "$APP/server.js" ] || { echo "[9router] ERROR: payload missing server.js" >&2; exit 1; }
+  printf '%s' "$PAYLOAD_VERSION" > "$MARK"
+  echo "[9router] payload installed"
 fi
 
-[ -d "$APP" ] || { echo "[9router] ERROR: app payload missing at $APP" >&2; exit 1; }
-[ -n "$TARGET" ] && printf '%s' "$TARGET" > "$MARK" 2>/dev/null || true
+# ---------- data dir ----------
+DATA="${DATA_DIR:-$BASE/9router/data}"
+mkdir -p "$DATA" 2>/dev/null || DATA="$BASE/data" && mkdir -p "$DATA"
 
-# ---------- secrets ----------
+# ---------- secrets (persist so restarts keep the same password) ----------
 if [ -z "${JWT_SECRET:-}" ]; then
   if [ -f "$DATA/jwt-secret" ]; then
     JWT_SECRET=$(cat "$DATA/jwt-secret")
@@ -188,32 +122,31 @@ fi
 export JWT_SECRET
 
 if [ -z "${INITIAL_PASSWORD:-}" ]; then
-  INITIAL_PASSWORD="admin-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-  printf '%s' "$INITIAL_PASSWORD" > "$DATA/initial-password"
-  chmod 600 "$DATA/initial-password" 2>/dev/null || true
-  echo ""
-  echo "=============================================================="
-  echo "  9router dashboard password (saved to $DATA/initial-password)"
-  echo "  $INITIAL_PASSWORD"
-  echo "=============================================================="
-  echo ""
+  if [ -f "$DATA/initial-password" ]; then
+    INITIAL_PASSWORD=$(cat "$DATA/initial-password")
+  else
+    INITIAL_PASSWORD="admin-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    printf '%s' "$INITIAL_PASSWORD" > "$DATA/initial-password"
+    chmod 600 "$DATA/initial-password" 2>/dev/null || true
+    echo ""
+    echo "=============================================================="
+    echo "  9router dashboard password (saved to $DATA/initial-password)"
+    echo "  $INITIAL_PASSWORD"
+    echo "=============================================================="
+    echo ""
+  fi
 fi
 export INITIAL_PASSWORD
 
-# ---------- runtime env, tuned for small hosts ----------
+# ---------- boot ----------
 export PORT
 export HOSTNAME="0.0.0.0"
 export NODE_ENV="production"
 export DATA_DIR="$DATA"
 export NEXT_TELEMETRY_DISABLED=1
 export AUTH_COOKIE_SECURE="${AUTH_COOKIE_SECURE:-false}"
+export NODE_OPTIONS="--max-old-space-size=${NODE_MAX_OLD_SPACE:-320}"
 
-# The bundled Next server was compiled with its own distDir; keep it intact and
-# run from the package dir so relative asset paths resolve.
-cd "$APP"
-
-# Node sizes its heap from total system RAM, which is far too eager on a 512 MB
-# egg. Measured steady-state here is ~79 MB.
-HEAP="${NODE_MAX_OLD_SPACE:-320}"
-echo "[9router] starting on 0.0.0.0:${PORT} (heap cap ${HEAP} MB)"
-exec node --max-old-space-size="$HEAP" server.js
+cd "$BASE/9router"
+echo "[9router] starting on 0.0.0.0:${PORT} (data: $DATA)"
+exec node app/server.js
