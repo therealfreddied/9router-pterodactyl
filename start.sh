@@ -6,7 +6,9 @@
 # package for its app payload, then launch its bundled Next.js server directly.
 
 set -eu
-cd "$(dirname "$0")"
+# Install into the working directory, not the script's own location. Panels
+# often curl the script to /tmp and expect the server files beside the home dir.
+cd "${INSTALL_DIR:-$PWD}"
 
 PORT="${SERVER_PORT:-${PORT:-10000}}"
 DATA="${DATA_DIR:-./data}"
